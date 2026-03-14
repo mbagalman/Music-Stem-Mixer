@@ -1,0 +1,8 @@
+numpy
+soundfile
+librosa
+pedalboard
+pyloudnorm
+scipy
+pyyaml
+numba

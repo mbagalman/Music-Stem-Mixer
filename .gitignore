@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Local audio inputs and render outputs
+stems/*.wav
+stems/*.aif
+stems/*.aiff
+stems/*.flac
+mix.wav
+*_report.txt
