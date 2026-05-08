@@ -15,7 +15,12 @@ The project takes a folder of stems and produces a single stereo WAV with:
 
 ```bash
 python -m venv venv
+
+# macOS/Linux:
 source venv/bin/activate
+# Windows (PowerShell):
+.\venv\Scripts\Activate.ps1
+
 pip install -r requirements.txt
 
 python stem_mixer_oop.py \
@@ -32,6 +37,8 @@ python stem_mixer_oop.py \
   --config ./config.yaml \
   --analyze-only
 ```
+
+The report is written next to `--out` as `<stem>_report.txt` (e.g. `mix_report.txt`). When `--analyze-only` is used without `--out`, it writes `analysis_report.txt` in the current directory.
 
 ## Repository Layout
 
@@ -58,7 +65,7 @@ python stem_mixer_oop.py \
 Run the automated suite with:
 
 ```bash
-python3 -m unittest discover -s tests -v
+python -m unittest discover -s tests -v
 ```
 
 ## Notes

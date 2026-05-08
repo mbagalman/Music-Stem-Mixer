@@ -344,6 +344,104 @@ class DeesserRoleTests(unittest.TestCase):
         self.assertEqual(stem.stats["deesser_mode"], "off")
 
 
+@unittest.skipUnless(HAVE_SOUNDFILE_FOR_TESTS, "soundfile not installed")
+class FullPipelineIntegrationTests(unittest.TestCase):
+    """End-to-end: real on-disk WAVs, real pedalboard, real limiter — no mocks.
+
+    Complements the fast mocked smoke test (test_integration_smoke_with_synthetic_audio).
+    Specifically guards against bugs that only surface when the real DSP path runs,
+    e.g. the P0-1 mono-load crash that the mocked test could not catch.
+    """
+
+    def test_full_render_from_disk(self):
+        sr = 48000
+        t = np.arange(sr) / sr  # 1 s — over pyloudnorm's 400 ms block size
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            stems_dir = tmp_path / "stems"
+            stems_dir.mkdir()
+
+            # Mono vocal — exercises stereoify's (1, N) branch (the P0-1 path).
+            vocal = (0.3 * np.sin(2 * math.pi * 440 * t)).astype(np.float32)
+            sf.write(str(stems_dir / "song_vocal.wav"), vocal, sr, subtype="FLOAT")
+
+            # Stereo drum (slightly decorrelated channels).
+            drum_l = (0.4 * np.sin(2 * math.pi * 60 * t)).astype(np.float32)
+            drum_r = (0.4 * np.sin(2 * math.pi * 60 * t + 0.1)).astype(np.float32)
+            sf.write(str(stems_dir / "song_drum.wav"),
+                     np.vstack([drum_l, drum_r]).T, sr, subtype="FLOAT")
+
+            # Stereo bass.
+            bass_l = (0.35 * np.sin(2 * math.pi * 80 * t)).astype(np.float32)
+            bass_r = (0.35 * np.sin(2 * math.pi * 80 * t + 0.05)).astype(np.float32)
+            sf.write(str(stems_dir / "song_bass.wav"),
+                     np.vstack([bass_l, bass_r]).T, sr, subtype="FLOAT")
+
+            cfg = base_config()
+            # Exercise the sidechain path too — low_band mode pulls in split_low_high.
+            cfg["sidechain"] = {
+                "enabled": True,
+                "trigger": "drums",
+                "targets": ["bass"],
+                "amount": 0.2,
+                "attack_ms": 5.0,
+                "release_ms": 80.0,
+                "mode": "low_band",
+                "low_band_hz": 150.0,
+            }
+            cfg["buses"]["bass"] = {
+                "target_rms_dbfs": -19.0,
+                "gain_db": 0.0,
+                "pan": 0.0,
+                "stereo_width": 1.0,
+                "mono_below_hz": 150.0,
+            }
+
+            files = sorted(stems_dir.glob("*.wav"))
+            instance = mixer.Mixer(
+                files=files,
+                cfg=cfg,
+                sr_cli=None,
+                chunk_samples=4096,
+                reference=None,
+            )
+            instance.process_stems()
+            instance.build_buses()
+            instance.apply_sidechain()
+            instance.render_mix()
+            instance.master_chain()
+
+            out_path = tmp_path / "mix.wav"
+            instance.save(out_path, bitdepth=24)
+            report_path = instance.save_report(out_path)
+
+            # Assert on saved artifacts before the tempdir is torn down.
+            self.assertTrue(out_path.exists())
+            self.assertGreater(out_path.stat().st_size, 0)
+            self.assertTrue(report_path.exists())
+            report_text = report_path.read_text(encoding="utf-8")
+            self.assertIn("Stem Mixer Report", report_text)
+            self.assertIn("vocals", report_text)
+            self.assertIn("drums", report_text)
+            self.assertIn("bass", report_text)
+
+            # Round-trip: the saved WAV must read back at the right shape.
+            written, written_sr = sf.read(str(out_path), always_2d=True)
+            self.assertEqual(written_sr, sr)
+            self.assertEqual(written.shape[1], 2)
+
+        self.assertIsNotNone(instance.mix)
+        ceiling_amp = mixer.db_to_amp(-1.0)
+        self.assertLessEqual(float(np.max(np.abs(instance.mix))), ceiling_amp + 1e-4)
+        self.assertEqual(set(instance.buses.keys()), {"vocals", "drums", "bass"})
+        self.assertEqual({s.role for s in instance.stems}, {"vocals", "drums", "bass"})
+        self.assertIn("master_limiter", instance.report)
+        self.assertLessEqual(
+            instance.report["master_limiter"]["post_peak_dbfs"], -1.0 + 1e-3
+        )
+
+
 class ReferenceCacheTests(unittest.TestCase):
     """The reference audio file is read at most once across the master chain."""
 

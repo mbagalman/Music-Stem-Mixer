@@ -18,7 +18,7 @@ You give the script a **folder of stems** (separate audio files like vocals, dru
 It’s designed to be:
 
 * **Simple for beginners** (sensible defaults).
-* **Safe for your computer** (chunked/streamed processing; won’t hog RAM).
+* **Modest memory use for typical material** — all stems and the rendered mix are held in RAM as 32-bit float stereo. See *Memory and performance* below for a rule of thumb.
 * **Customizable** via a human-readable **YAML config** file.
 
 ---
@@ -27,12 +27,12 @@ It’s designed to be:
 
 * Canonical script:
   **[stem\_mixer\_oop.py](./stem_mixer_oop.py)**
-* Baseline configuration:
-  **[config.yaml](./config.yaml)**
-* Optional vocal de-esser preset:
-  **[config\_with\_deesser.yaml](./config_with_deesser.yaml)**
+* **[config.yaml](./config.yaml)** — baseline preset; built-in de-esser on vocals, `target_lufs: -14`.
+* **[config\_with\_deesser.yaml](./config_with_deesser.yaml)** — same as baseline, but vocals route through an external VST3 de-esser when one is configured (falls back to built-in if the plugin can't be loaded).
+* **[config\_cleaner\_headroom.yaml](./config_cleaner_headroom.yaml)** — gentler mastering: lower bus targets (-22 to -20.5 dBFS), `target_lufs: -15`, limiter ceiling -1.5 dBFS. Use when the baseline preset sounds squashed.
+* **[config\_debug\_no\_deesser.yaml](./config_debug_no_deesser.yaml)** — diagnostic preset with `deesser.mode: off` on vocals and even more headroom (`target_lufs: -16`). Use to A/B whether the de-esser is causing artifacts on a specific song.
 
-> This directory now uses a single canonical script. Start with `config.yaml`, then switch to the de-esser preset if you want external vocal de-essing.
+> Start with `config.yaml`. Switch to the de-esser preset if you want external vocal de-essing, the cleaner-headroom preset if the default loudness is too aggressive, or the debug preset to isolate de-esser-related issues.
 
 ---
 
@@ -122,10 +122,10 @@ python stem_mixer_oop.py \
 **When to tweak options**
 
 * `--sr`: If your stems are mismatched, set a target (44100 or 48000 are common).
-* `--chunk_samples`: Lower this if you run out of memory; raise it for speed.
+* `--chunk_samples`: Effect-chain block size (default `262144`). Doesn't shrink the in-memory stems; see *Memory and performance*.
 * `--bitdepth`: Use 24 for high-quality; 16 if you specifically need CD standard.
 * `--reference`: Matches loudness and can optionally report/apply spectral tilt guidance.
-* `--analyze-only`: Loads stems, checks alignment/hotness/clipping/role counts, and writes the report without rendering audio.
+* `--analyze-only`: Loads stems, checks alignment/hotness/clipping/role counts, and writes the report without rendering audio. With `--out`, the report is named after it (e.g. `mix_report.txt` for `--out mix.wav`); without `--out`, it writes `analysis_report.txt` in the working directory.
 
 ---
 
@@ -274,8 +274,8 @@ master:
 
 ## Output files you’ll get
 
-* **`mix.wav`**: Your final stereo mix (bit depth you chose).
-* **`mix_report.txt`**: What was processed, per-stem levels/peaks, master settings, LUFS info.
+* **`mix.wav`** (or whatever you passed to `--out`): Your final stereo mix at the bit depth you chose.
+* **`<out>_report.txt`** (e.g. `mix_report.txt` for `--out mix.wav`): What was processed, per-stem levels/peaks, master settings, LUFS info. With `--analyze-only` and no `--out`, the report is named `analysis_report.txt`.
 
 ### Reading the report
 
@@ -285,12 +285,13 @@ master:
 
 ---
 
-## Performance tips
+## Memory and performance
 
-* If you see slowdowns or RAM spikes, lower `--chunk_samples`:
+The script holds every input stem and the rendered mix in RAM as 32-bit float stereo. Rule of thumb at 48 kHz: **~22 MB per minute per stereo stem**. A 4-minute song with 6 stems is roughly **530 MB of input audio**, plus another ~90 MB for the rendered mix and intermediate buffers. If you're mixing long sessions or many stems on a low-RAM laptop, render shorter sections at a time.
 
-  * Start with `262144` (default). Try `131072` or `65536` if needed.
-* Multiband uses zero-phase filters (`sosfiltfilt`), which need full buffers—disable it for very long tracks if performance matters.
+* `--chunk_samples` controls the block size used **inside** each Pedalboard effect call. It does **not** shrink the in-memory stems — the full audio is loaded regardless. The default (`262144`) is fine for most cases; lowering it (e.g. `131072`, `65536`) can reduce peak memory *inside* a single effect chain but won't change overall RAM usage materially.
+* Multiband uses zero-phase filters (`sosfiltfilt`), which process the entire mix at once. Disable it for very long tracks if performance matters.
+* The peak limiter and envelope follower use Numba JIT acceleration when the `numba` package is installed (it's listed in `requirements.txt`). Without it both fall back to pure-Python loops, which are significantly slower on long mixes.
 
 ---
 
@@ -359,12 +360,14 @@ python stem_mixer_oop.py --in ./stems --out ./mix.wav --config ./config.yaml \
   --reference ./favorite_mix.wav
 ```
 
-### Low-memory laptop mode
+### Smaller effect-chain blocks
 
 ```bash
 python stem_mixer_oop.py --in ./stems --out ./mix.wav --config ./config.yaml \
   --chunk_samples 65536
 ```
+
+Lowers the per-effect block size used inside Pedalboard. Note that this does **not** materially reduce overall memory — every stem is still loaded into RAM in full. To genuinely reduce RAM use, render fewer or shorter stems per run.
 
 ---
 

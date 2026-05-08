@@ -3,12 +3,12 @@ __pycache__/
 *.py[cod]
 .DS_Store
 
-# Local audio inputs and render outputs
-stems/*.wav
-stems/*.aif
-stems/*.aiff
-stems/*.flac
-mix.wav
+# Local audio (inputs in stems/, render outputs anywhere — never committed).
+# Use `git add -f <path>` if you ever genuinely need to track an audio asset.
+*.wav
+*.aif
+*.aiff
+*.flac
 *_report.txt
 
 # Local planning notes
