@@ -15,8 +15,8 @@ This build focuses on better default mixing behavior for Suno-style stems:
 from __future__ import annotations
 
 import argparse
-import glob
 import math
+import re
 import sys
 import warnings
 from pathlib import Path
@@ -289,15 +289,16 @@ def apply_stereo_width(y: np.ndarray, width: float, normalize_peaks: bool = True
 
 
 def apply_pan(y: np.ndarray, pan: float) -> np.ndarray:
-    if y.shape[0] != 2 or abs(pan) < 1e-6:
+    # Equal-power (constant-power) pan: θ ∈ [0, π/2] across pan ∈ [-1, +1].
+    # At pan=0 both gains drop to √0.5 ≈ 0.707, which is the intended center —
+    # not a no-op. Bus RMS gain-staging (applied after pan) absorbs the level shift.
+    if y.shape[0] != 2:
         return y
     pan = float(max(-1.0, min(1.0, pan)))
-    if pan >= 0.0:
-        left_gain, right_gain = 1.0 - pan, 1.0
-    else:
-        left_gain, right_gain = 1.0, 1.0 + pan
-    out = np.vstack([y[0] * left_gain, y[1] * right_gain])
-    return safe_peak_normalize(out, calc_peak_dbfs(y))
+    theta = (pan + 1.0) * (math.pi / 4.0)
+    left_gain = math.cos(theta)
+    right_gain = math.sin(theta)
+    return np.vstack([y[0] * left_gain, y[1] * right_gain])
 
 
 def leading_silence_samples(y: np.ndarray, threshold_dbfs: float) -> int:
@@ -676,6 +677,10 @@ def load_config(path: Optional[Path]) -> FullConfig:
     return normalized
 
 
+# Splits a file stem into tokens on non-alphanumeric runs, CamelCase boundaries, and letter↔digit boundaries.
+_TOKEN_SPLIT = re.compile(r"[^a-zA-Z0-9]+|(?<=[a-z])(?=[A-Z])|(?<=[a-zA-Z])(?=\d)|(?<=\d)(?=[a-zA-Z])")
+
+
 class Stem:
     def __init__(self, path: Path, sr: int, cfg: FullConfig):
         self.path = path
@@ -691,10 +696,17 @@ class Stem:
 
     @staticmethod
     def _detect_role(path: Path, det: Dict[str, List[str]]) -> str:
-        base = path.name.lower()
+        tokens = {t.lower() for t in _TOKEN_SPLIT.split(path.stem) if t}
         for role, keys in det.items():
-            if any(key in base for key in keys):
-                return role
+            for key in keys:
+                key_lower = key.lower()
+                if key_lower in tokens:
+                    return role
+                # Tolerate simple English plural mismatches between key and token.
+                if key_lower + "s" in tokens:
+                    return role
+                if key_lower.endswith("s") and key_lower[:-1] in tokens:
+                    return role
         return "default"
 
     def _analyze_input(self, alignment_cfg: AlignmentCfg) -> None:
@@ -731,42 +743,25 @@ class Stem:
         deesser_cfg = dict(DEFAULT_DEESSER)
         deesser_cfg.update(self.cfg.get("deesser", {}))
         mode = deesser_cfg.get("mode", "off")
-        if self.role != "vocals":
-            return "off", None, None
         if mode == "off":
             return "off", None, None
         if mode == "external":
-            for plug_path in self._external_deesser_candidates(deesser_cfg):
-                try:
-                    plugin = load_plugin(plug_path) if HAVE_PEDALBOARD else None
-                    if plugin is not None:
-                        return "external", plugin, plug_path
-                except Exception as exc:
-                    self.diagnostics.append(f"{self.path.name}: external de-esser failed to load ({plug_path}): {exc}")
+            raw_path = deesser_cfg.get("external_deesser_vst3")
+            plug_path = raw_path.strip() if isinstance(raw_path, str) else ""
+            if not plug_path:
+                self.diagnostics.append(
+                    f"{self.path.name}: external de-esser requested but no external_deesser_vst3 path configured; falling back to builtin"
+                )
+                return "builtin", None, None
+            try:
+                plugin = load_plugin(plug_path) if HAVE_PEDALBOARD else None
+                if plugin is not None:
+                    return "external", plugin, plug_path
+            except Exception as exc:
+                self.diagnostics.append(f"{self.path.name}: external de-esser failed to load ({plug_path}): {exc}")
             self.diagnostics.append(f"{self.path.name}: external de-esser unavailable; falling back to builtin")
             return "builtin", None, None
         return "builtin", None, None
-
-    def _external_deesser_candidates(self, deesser_cfg: DeesserCfg) -> List[str]:
-        candidates: List[str] = []
-        path = deesser_cfg.get("external_deesser_vst3")
-        if isinstance(path, str) and path.strip():
-            candidates.append(path.strip())
-        if sys.platform.startswith("win"):
-            candidates.append(r"C:\Program Files\Common Files\VST3\T-De-Esser 2.vst3")
-            candidates.append(r"C:\Program Files\Common Files\VST3\T-De-Esser.vst3")
-            for pattern in (
-                r"C:\Program Files (x86)\Techivation\T-De-Esser 2\*.vst3",
-                r"C:\Program Files (x86)\Techivation\T-De-Esser 2\VST3\*.vst3",
-            ):
-                candidates.extend(glob.glob(pattern))
-        seen = set()
-        ordered = []
-        for candidate in candidates:
-            if candidate not in seen:
-                seen.add(candidate)
-                ordered.append(candidate)
-        return ordered
 
     def process(self, chunk_samples: int) -> None:
         effects = [HighpassFilter(float(self.cfg.get("hpf_hz", 50.0)))]
@@ -865,8 +860,16 @@ class Mixer:
         self.stems = [Stem(path, self.sr, cfg) for path in files]
         self.buses: Dict[str, Bus] = {}
         self.mix: Optional[np.ndarray] = None
+        self._reference_audio: Optional[np.ndarray] = None
         self._collect_initial_diagnostics()
         self._apply_alignment_if_enabled()
+
+    def _get_reference_audio(self) -> Optional[np.ndarray]:
+        if self.reference is None:
+            return None
+        if self._reference_audio is None:
+            self._reference_audio, _ = read_audio_file(self.reference, self.sr)
+        return self._reference_audio
 
     def _collect_initial_diagnostics(self) -> None:
         diagnostics = self.report["diagnostics"]
@@ -1001,7 +1004,8 @@ class Mixer:
         mode = match_cfg.get("tonal_balance_mode", "off")
         if mode == "off":
             return
-        reference_audio, _ = read_audio_file(self.reference, self.sr)
+        reference_audio = self._get_reference_audio()
+        assert reference_audio is not None  # reference is not None, so cache returns audio
         mix_tilt = compute_spectral_tilt(self.mix, self.sr)
         ref_tilt = compute_spectral_tilt(reference_audio, self.sr)
         delta = ref_tilt - mix_tilt
@@ -1062,7 +1066,8 @@ class Mixer:
         master = self.cfg["master"]
         target_lufs = float(master.get("target_lufs", -14.0))
         if HAVE_LOUDNORM and self.reference is not None:
-            reference_audio, _ = read_audio_file(self.reference, self.sr)
+            reference_audio = self._get_reference_audio()
+            assert reference_audio is not None
             ref_lufs = pyln.Meter(self.sr).integrated_loudness(reference_audio.T.astype(np.float32))
             self.report["reference_lufs"] = ref_lufs
             target_lufs = ref_lufs

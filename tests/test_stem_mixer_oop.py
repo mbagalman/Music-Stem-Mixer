@@ -264,5 +264,227 @@ class AudioLoadTests(unittest.TestCase):
         np.testing.assert_array_equal(out[0], out[1])
 
 
+@unittest.skipUnless(HAVE_SOUNDFILE_FOR_TESTS, "soundfile not installed")
+class DeesserRoleTests(unittest.TestCase):
+    """De-essing is driven by chain config, not by hard-coded role names."""
+
+    def test_non_vocal_role_can_be_de_essed(self):
+        cfg = base_config()
+        cfg["stem_detection"]["harmony"] = ["harmony"]
+        cfg["chains"]["harmony"] = {
+            "hpf_hz": 80.0,
+            "stereo_width": 1.0,
+            "deesser": {
+                "mode": "builtin",
+                "frequency_hz": 6200.0,
+                "threshold_db": -28.0,
+                "ratio": 4.0,
+                "amount": 0.5,
+                "attack_ms": 2.0,
+                "release_ms": 90.0,
+            },
+            "compressor": {
+                "threshold_db": -18.0,
+                "ratio": 2.0,
+                "attack_ms": 10.0,
+                "release_ms": 80.0,
+            },
+            "eq_peaks": [],
+            "parallel_comp_blend": 0.0,
+        }
+
+        sr = cfg["sample_rate"]
+        tone = (0.3 * np.sin(2 * math.pi * 440 * np.arange(sr) / sr)).astype(np.float32)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "song_harmony.wav"
+            sf.write(str(path), tone, sr, subtype="FLOAT")
+            stem = mixer.Stem(path, sr, cfg)
+            stem.process(chunk_samples=4096)
+
+        self.assertEqual(stem.role, "harmony")
+        self.assertEqual(stem.stats["deesser_mode"], "builtin")
+
+    def test_external_deesser_without_path_falls_back_to_builtin(self):
+        cfg = base_config()
+        cfg["chains"]["vocals"]["deesser"] = {
+            "mode": "external",
+            # Notably: no external_deesser_vst3 key.
+            "frequency_hz": 6000.0,
+            "ratio": 4.0,
+            "amount": 0.5,
+        }
+        sr = cfg["sample_rate"]
+        tone = (0.3 * np.sin(2 * math.pi * 440 * np.arange(sr) / sr)).astype(np.float32)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "song_vocal.wav"
+            sf.write(str(path), tone, sr, subtype="FLOAT")
+            stem = mixer.Stem(path, sr, cfg)
+            mode, plugin, plug_path = stem._resolve_deesser()
+
+        self.assertEqual(stem.role, "vocals")
+        self.assertEqual(mode, "builtin")
+        self.assertIsNone(plugin)
+        self.assertIsNone(plug_path)
+        self.assertTrue(
+            any("no external_deesser_vst3 path configured" in d for d in stem.diagnostics),
+            f"expected 'no path configured' diagnostic, got: {stem.diagnostics}",
+        )
+
+    def test_role_with_no_deesser_config_stays_off(self):
+        cfg = base_config()
+        sr = cfg["sample_rate"]
+        tone = (0.3 * np.sin(2 * math.pi * 60 * np.arange(sr) / sr)).astype(np.float32)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "song_drum.wav"
+            sf.write(str(path), tone, sr, subtype="FLOAT")
+            stem = mixer.Stem(path, sr, cfg)
+            stem.process(chunk_samples=4096)
+
+        self.assertEqual(stem.role, "drums")
+        self.assertEqual(stem.stats["deesser_mode"], "off")
+
+
+class ReferenceCacheTests(unittest.TestCase):
+    """The reference audio file is read at most once across the master chain."""
+
+    def test_reference_read_once_when_both_consumers_active(self):
+        cfg = base_config()
+        # Activate both reference consumers: tonal-balance report + LUFS targeting.
+        cfg["master"]["reference_match"]["tonal_balance_mode"] = "report"
+
+        sr = cfg["sample_rate"]
+        t = np.arange(sr) / sr
+        library = {
+            "song_vocal.wav": np.vstack([0.2 * np.sin(2 * math.pi * 440 * t)] * 2).astype(np.float32),
+            "song_drum.wav": np.vstack([0.4 * np.sin(2 * math.pi * 60 * t)] * 2).astype(np.float32),
+            "song_bass.wav": np.vstack([0.35 * np.sin(2 * math.pi * 80 * t)] * 2).astype(np.float32),
+            "ref.wav": np.vstack([0.3 * np.sin(2 * math.pi * 200 * t)] * 2).astype(np.float32),
+        }
+
+        ref_reads = 0
+
+        def counting_read(path, target_sr):
+            nonlocal ref_reads
+            if Path(path).name == "ref.wav":
+                ref_reads += 1
+            return library[Path(path).name], target_sr
+
+        with mock.patch.object(mixer, "read_audio_file", side_effect=counting_read), \
+            mock.patch.object(mixer, "run_board", side_effect=lambda audio, board, sr, chunk: audio), \
+            mock.patch.object(mixer, "Compressor", side_effect=lambda **kwargs: object()), \
+            mock.patch.object(mixer, "HighpassFilter", side_effect=lambda *args, **kwargs: object()), \
+            mock.patch.object(mixer, "HighShelfFilter", side_effect=lambda *args, **kwargs: object()), \
+            mock.patch.object(mixer, "PeakFilter", side_effect=lambda *args, **kwargs: object()):
+            instance = mixer.Mixer(
+                files=[Path("song_vocal.wav"), Path("song_drum.wav"), Path("song_bass.wav")],
+                cfg=cfg,
+                sr_cli=None,
+                chunk_samples=4096,
+                reference=Path("ref.wav"),
+            )
+            instance.process_stems()
+            instance.build_buses()
+            instance.render_mix()
+            instance.master_chain()
+
+        # Both `_apply_reference_tonal_balance` (mode=report) and
+        # `_apply_loudness_and_reference` (LUFS) hit the reference path —
+        # without caching this would be 2.
+        self.assertEqual(ref_reads, 1)
+
+
+class PanLawTests(unittest.TestCase):
+    """Equal-power pan: cos/sin gains, constant L²+R² across pan positions."""
+
+    def setUp(self):
+        sr = 48000
+        t = np.arange(sr // 4) / sr
+        tone = (0.5 * np.sin(2 * math.pi * 440 * t)).astype(np.float32)
+        self.mono = np.vstack([tone, tone])  # mono content duplicated to L/R
+
+    def test_center_uses_root_two_over_two_gains(self):
+        out = mixer.apply_pan(self.mono, 0.0)
+        expected = math.sqrt(0.5)
+        np.testing.assert_allclose(out[0], self.mono[0] * expected, atol=1e-6)
+        np.testing.assert_allclose(out[1], self.mono[1] * expected, atol=1e-6)
+        # The new behavior is intentional: pan=0 is no longer a no-op.
+        self.assertFalse(np.array_equal(out, self.mono))
+
+    def test_summed_power_constant_across_pan_positions(self):
+        # cos²θ + sin²θ = 1 → for mono-duplicated input, ||L||² + ||R||² is
+        # constant for any pan. This is the defining equal-power property.
+        energies = [
+            float(np.sum(mixer.apply_pan(self.mono, p) ** 2))
+            for p in (-1.0, -0.5, -0.15, 0.0, 0.15, 0.5, 1.0)
+        ]
+        spread = max(energies) - min(energies)
+        self.assertLess(spread, 1e-6 * energies[0])
+
+    def test_hard_pans_silence_opposite_channel(self):
+        left = mixer.apply_pan(self.mono, -1.0)
+        right = mixer.apply_pan(self.mono, 1.0)
+        self.assertLess(float(np.max(np.abs(left[1]))), 1e-6)
+        self.assertLess(float(np.max(np.abs(right[0]))), 1e-6)
+        # The driven channel keeps full original amplitude.
+        np.testing.assert_allclose(left[0], self.mono[0], atol=1e-6)
+        np.testing.assert_allclose(right[1], self.mono[1], atol=1e-6)
+
+    def test_non_stereo_input_passes_through(self):
+        mono_1d = self.mono[0]
+        out = mixer.apply_pan(mono_1d, 0.5)
+        np.testing.assert_array_equal(out, mono_1d)
+
+
+class RoleDetectionTests(unittest.TestCase):
+    """Token-aware role detection: substrings inside other words must not match."""
+
+    def setUp(self):
+        # Mirrors config.yaml's stem_detection block.
+        self.det = {
+            "vocals": ["vox", "vocal", "lead", "singer"],
+            "drums": ["drum", "drums", "kit", "percussion"],
+            "bass": ["bass", "sub"],
+            "guitar": ["gtr", "guitar"],
+            "keys": ["keys", "piano", "synth", "pad", "rhodes", "organ"],
+        }
+
+    def _detect(self, name: str) -> str:
+        return mixer.Stem._detect_role(Path(name), self.det)
+
+    def test_classic_filenames_still_detect(self):
+        self.assertEqual(self._detect("song_vocals_lead.wav"), "vocals")
+        self.assertEqual(self._detect("song_drums_kick.wav"), "drums")
+        self.assertEqual(self._detect("song_bass.wav"), "bass")
+        self.assertEqual(self._detect("song_gtr_left.wav"), "guitar")
+        self.assertEqual(self._detect("song_piano.wav"), "keys")
+
+    def test_substring_collisions_no_longer_misclassify(self):
+        # Pre-fix: "sub" matched submix → bass; "pad" matched padded_drums → keys.
+        self.assertEqual(self._detect("submix.wav"), "default")
+        self.assertEqual(self._detect("padded_drums.wav"), "drums")
+        # subtle_synth still legitimately matches keys (via "synth"), just no longer via "sub".
+        self.assertEqual(self._detect("subtle_synth.wav"), "keys")
+
+    def test_plural_singular_tolerance(self):
+        # Detection key "vocal" matches a "vocals.wav" filename even though the
+        # token is plural; same for "drum" against "drums.wav".
+        self.assertEqual(self._detect("vocals.wav"), "vocals")
+        self.assertEqual(self._detect("drums.wav"), "drums")
+        # Reverse direction: "keys" key matches a "key.wav" filename.
+        self.assertEqual(self._detect("key.wav"), "keys")
+
+    def test_camelcase_filenames_split(self):
+        self.assertEqual(self._detect("SongVocals.wav"), "vocals")
+        self.assertEqual(self._detect("KickDrum.wav"), "drums")
+
+    def test_letter_digit_boundary_split(self):
+        self.assertEqual(self._detect("Vocal01.wav"), "vocals")
+        self.assertEqual(self._detect("drum_take_2.wav"), "drums")
+
+    def test_unknown_filename_returns_default(self):
+        self.assertEqual(self._detect("foo_bar.wav"), "default")
+        self.assertEqual(self._detect("submix.wav"), "default")
+
+
 if __name__ == "__main__":
     unittest.main()
