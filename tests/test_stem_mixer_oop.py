@@ -1,5 +1,6 @@
 import copy
 import math
+import tempfile
 import unittest
 import warnings
 from pathlib import Path
@@ -8,6 +9,13 @@ from unittest import mock
 import numpy as np
 
 import stem_mixer_oop as mixer
+
+try:
+    import soundfile as sf
+    HAVE_SOUNDFILE_FOR_TESTS = True
+except Exception:
+    sf = None
+    HAVE_SOUNDFILE_FOR_TESTS = False
 
 
 def base_config():
@@ -171,8 +179,9 @@ class StemMixerTests(unittest.TestCase):
             "mono_below_hz": 150.0,
         }
 
+        # 1 s of audio — long enough to exceed pyloudnorm's 400 ms block size when installed.
         sr = 48000
-        t = np.arange(sr // 8) / sr
+        t = np.arange(sr) / sr
         library = {
             "song_vocal.wav": np.vstack([0.2 * np.sin(2 * math.pi * 440 * t), 0.2 * np.sin(2 * math.pi * 440 * t)]).astype(np.float32),
             "song_drum.wav": np.vstack([0.4 * np.sin(2 * math.pi * 60 * t), 0.4 * np.sin(2 * math.pi * 60 * t)]).astype(np.float32),
@@ -205,6 +214,54 @@ class StemMixerTests(unittest.TestCase):
         self.assertIn("master_limiter", instance.report)
         self.assertIn("vocals", instance.buses)
         self.assertLessEqual(np.max(np.abs(instance.mix)), mixer.db_to_amp(-1.0) + 1e-4)
+
+
+@unittest.skipUnless(HAVE_SOUNDFILE_FOR_TESTS, "soundfile not installed")
+class AudioLoadTests(unittest.TestCase):
+    """Real on-disk WAV round-trip — no mocks of soundfile or stereoify."""
+
+    def setUp(self):
+        self.sr = 48000
+        self.t = np.arange(self.sr // 4) / self.sr
+        self.tone = np.sin(2 * math.pi * 440 * self.t).astype(np.float32)
+
+    def _write(self, path: Path, data: np.ndarray) -> None:
+        # soundfile expects (frames,) for mono and (frames, channels) for multi.
+        sf.write(str(path), data, self.sr, subtype="FLOAT")
+
+    def test_read_audio_file_loads_mono_as_stereo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mono.wav"
+            self._write(path, self.tone)
+            audio, sr = mixer.read_audio_file(path, self.sr)
+        self.assertEqual(sr, self.sr)
+        self.assertEqual(audio.shape, (2, self.tone.shape[0]))
+        np.testing.assert_allclose(audio[0], audio[1], atol=1e-6)
+        np.testing.assert_allclose(audio[0], self.tone, atol=1e-5)
+
+    def test_read_audio_file_preserves_stereo(self):
+        stereo = np.vstack([self.tone, -self.tone]).T  # (frames, 2)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "stereo.wav"
+            self._write(path, stereo)
+            audio, sr = mixer.read_audio_file(path, self.sr)
+        self.assertEqual(sr, self.sr)
+        self.assertEqual(audio.shape, (2, self.tone.shape[0]))
+        np.testing.assert_allclose(audio[0], self.tone, atol=1e-5)
+        np.testing.assert_allclose(audio[1], -self.tone, atol=1e-5)
+
+    def test_stereoify_handles_one_by_n(self):
+        # The exact shape produced by soundfile.read(always_2d=True) on mono, then .T.
+        one_by_n = self.tone.reshape(1, -1)
+        out = mixer.stereoify(one_by_n)
+        self.assertEqual(out.shape, (2, self.tone.shape[0]))
+        np.testing.assert_array_equal(out[0], out[1])
+
+    def test_stereoify_handles_n_by_one(self):
+        n_by_one = self.tone.reshape(-1, 1)
+        out = mixer.stereoify(n_by_one)
+        self.assertEqual(out.shape, (2, self.tone.shape[0]))
+        np.testing.assert_array_equal(out[0], out[1])
 
 
 if __name__ == "__main__":

@@ -243,6 +243,11 @@ def stereoify(y: np.ndarray) -> np.ndarray:
         return y
     if y.shape[1] == 2:
         return y.T
+    # soundfile.read(always_2d=True) returns (frames, 1) for mono → (1, frames) after .T.
+    if y.shape[0] == 1:
+        return np.vstack([y[0], y[0]])
+    if y.shape[1] == 1:
+        return np.vstack([y[:, 0], y[:, 0]])
     raise ValueError(f"Unsupported channel layout {y.shape}; expected mono or stereo input")
 
 
@@ -428,19 +433,36 @@ def apply_builtin_deesser(y: np.ndarray, sr: int, cfg: DeesserCfg) -> np.ndarray
     return low + high * gain[np.newaxis, :]
 
 
-def apply_peak_limiter(y: np.ndarray, sr: int, ceiling_dbfs: float, release_ms: float) -> np.ndarray:
-    ceiling_amp = db_to_amp(ceiling_dbfs)
-    release_coeff = math.exp(-1.0 / (sr * (release_ms / 1000.0)))
-    gains = np.ones(y.shape[1], dtype=np.float32)
+def _limiter_compute_gains(peaks: np.ndarray, ceiling_amp: float, release_coeff: float) -> np.ndarray:
+    n = peaks.shape[0]
+    gains = np.empty(n, dtype=np.float32)
     current_gain = 1.0
-    for i in range(y.shape[1]):
-        peak = float(np.max(np.abs(y[:, i])))
-        required_gain = min(1.0, ceiling_amp / max(peak, 1e-12))
+    for i in range(n):
+        peak = peaks[i]
+        if peak < 1e-12:
+            peak = 1e-12
+        required_gain = ceiling_amp / peak
+        if required_gain > 1.0:
+            required_gain = 1.0
         if required_gain < current_gain:
             current_gain = required_gain
         else:
-            current_gain = min(1.0, release_coeff * current_gain + (1.0 - release_coeff))
+            current_gain = release_coeff * current_gain + (1.0 - release_coeff)
+            if current_gain > 1.0:
+                current_gain = 1.0
         gains[i] = current_gain
+    return gains
+
+
+if HAVE_NUMBA:
+    _limiter_compute_gains = njit(cache=True)(_limiter_compute_gains)  # type: ignore[assignment]
+
+
+def apply_peak_limiter(y: np.ndarray, sr: int, ceiling_dbfs: float, release_ms: float) -> np.ndarray:
+    ceiling_amp = db_to_amp(ceiling_dbfs)
+    release_coeff = math.exp(-1.0 / (sr * (release_ms / 1000.0)))
+    peaks = np.max(np.abs(y), axis=0).astype(np.float32, copy=False)
+    gains = _limiter_compute_gains(peaks, float(ceiling_amp), float(release_coeff))
     return safe_peak_normalize(y * gains[np.newaxis, :], peak_dbfs=ceiling_dbfs)
 
 

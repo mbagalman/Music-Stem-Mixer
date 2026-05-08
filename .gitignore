@@ -10,3 +10,6 @@ stems/*.aiff
 stems/*.flac
 mix.wav
 *_report.txt
+
+# Local planning notes
+TICKETS.md

@@ -1,8 +1,9 @@
-numpy
-soundfile
-librosa
-pedalboard
-pyloudnorm
-scipy
-pyyaml
-numba
+# Pinned floors. Pedalboard's IIR filter parameter names have changed across
+# major releases (e.g. gain_factor vs gain_db); cap to current series.
+numpy>=1.22,<3.0
+soundfile>=0.12.1
+pedalboard>=0.9.0,<1.0
+pyloudnorm>=0.1.1
+scipy>=1.10,<2.0
+pyyaml>=6.0
+numba>=0.59
